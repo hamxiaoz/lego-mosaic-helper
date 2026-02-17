@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LEGO Plate Helper</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #1a1a2e;
+    color: #eee;
+    overflow: hidden;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Top bar */
+  #toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 16px;
+    background: #16213e;
+    border-bottom: 1px solid #0f3460;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+  }
+  #toolbar h1 { font-size: 16px; font-weight: 600; margin-right: 8px; }
+  #toolbar button, #toolbar label {
+    background: #0f3460;
+    color: #eee;
+    border: 1px solid #533483;
+    padding: 5px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  #toolbar button:hover, #toolbar label:hover { background: #533483; }
+  #toolbar button.active { background: #533483; border-color: #e94560; }
+  #info-panel {
+    font-size: 13px;
+    margin-left: auto;
+    display: flex;
+    gap: 16px;
+    align-items: center;
+  }
+  #info-panel span { white-space: nowrap; }
+
+  /* Main area */
+  #main { flex: 1; position: relative; overflow: hidden; }
+  #grid-canvas {
+    position: absolute;
+    top: 0; left: 0;
+    cursor: crosshair;
+  }
+
+  /* Import overlay */
+  #import-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(26, 26, 46, 0.95);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+  #import-overlay.hidden { display: none; }
+
+  #drop-zone {
+    width: 400px;
+    height: 250px;
+    border: 3px dashed #533483;
+    border-radius: 12px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    transition: border-color 0.2s;
+  }
+  #drop-zone.dragover { border-color: #e94560; background: rgba(83, 52, 131, 0.2); }
+  #drop-zone p { font-size: 16px; color: #aaa; }
+  #drop-zone label {
+    background: #533483;
+    color: #fff;
+    padding: 8px 20px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  #drop-zone label:hover { background: #e94560; }
+  #file-input { display: none; }
+
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <h1>LEGO Plate Helper</h1>
+  <button id="btn-import">Import Image</button>
+  <button id="btn-section-grid">Section Grid</button>
+  <button id="btn-correction">Correction Mode</button>
+  <button id="btn-fit">Fit to Screen</button>
+  <div id="info-panel">
+    <span id="info-coords">—</span>
+    <span id="info-color">—</span>
+    <span id="info-dist">—</span>
+  </div>
+</div>
+
+<div id="main">
+  <canvas id="grid-canvas"></canvas>
+
+  <div id="import-overlay">
+    <div id="drop-zone">
+      <p>Drop a LEGO plate image here</p>
+      <label for="file-input">Choose File</label>
+      <input type="file" id="file-input" accept="image/*">
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ─── Constants & Palette ───────────────────────────────────────────
+const GRID_SIZE = 48;
+const SECTION_SIZE = 8;
+
+const PALETTE = [
+  { name: 'Yellow',     rgb: [243, 207,  69], css: '#f3cf45' },
+  { name: 'Black',      rgb: [ 33,  33,  33], css: '#212121' },
+  { name: 'White',      rgb: [242, 242, 242], css: '#f2f2f2' },
+  { name: 'Light Gray', rgb: [180, 180, 180], css: '#b4b4b4' },
+  { name: 'Dark Gray',  rgb: [100, 100, 100], css: '#646464' },
+];
+
+// ─── State ─────────────────────────────────────────────────────────
+let grid = null;           // grid[row][col] = paletteIndex
+let hoverCell = null;      // {r, c} or null
+let scale = 1;
+let offsetX = 0, offsetY = 0;
+let sectionGridOn = false;
+let correctionMode = false;
+let isPanning = false;
+let panStartX, panStartY, panStartOX, panStartOY;
+
+const DOT_RADIUS_FRAC = 0.38; // fraction of cell size
+const CELL_SIZE_BASE = 14;     // base cell size in px
+
+// ─── DOM ───────────────────────────────────────────────────────────
+const canvas = document.getElementById('grid-canvas');
+const ctx = canvas.getContext('2d');
+const mainEl = document.getElementById('main');
+const importOverlay = document.getElementById('import-overlay');
+
+const infoCoords = document.getElementById('info-coords');
+const infoColor = document.getElementById('info-color');
+const infoDist = document.getElementById('info-dist');
+
+const btnImport = document.getElementById('btn-import');
+const btnSectionGrid = document.getElementById('btn-section-grid');
+const btnCorrection = document.getElementById('btn-correction');
+const btnFit = document.getElementById('btn-fit');
+
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+
+// ─── Color Snapping ────────────────────────────────────────────────
+function closestPaletteIndex(r, g, b) {
+  let bestIdx = 0, bestDist = Infinity;
+  for (let i = 0; i < PALETTE.length; i++) {
+    const [pr, pg, pb] = PALETTE[i].rgb;
+    const d = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2;
+    if (d < bestDist) { bestDist = d; bestIdx = i; }
+  }
+  return bestIdx;
+}
+
+// ─── Image Import ──────────────────────────────────────────────────
+let loadedImage = null;
+
+function handleFile(file) {
+  if (!file || !file.type.startsWith('image/')) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    const img = new Image();
+    img.onload = () => {
+      loadedImage = img;
+      extractGrid();
+      importOverlay.classList.add('hidden');
+      fitToScreen();
+      render();
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  handleFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', () => handleFile(fileInput.files[0]));
+btnImport.addEventListener('click', () => {
+  importOverlay.classList.remove('hidden');
+});
+
+// ─── Extract Grid from Full Image ─────────────────────────────────
+function extractGrid() {
+  const offCanvas = document.createElement('canvas');
+  offCanvas.width = loadedImage.width;
+  offCanvas.height = loadedImage.height;
+  const offCtx = offCanvas.getContext('2d');
+  offCtx.drawImage(loadedImage, 0, 0);
+
+  const imgW = loadedImage.width, imgH = loadedImage.height;
+
+  grid = [];
+  for (let r = 0; r < GRID_SIZE; r++) {
+    grid[r] = [];
+    for (let c = 0; c < GRID_SIZE; c++) {
+      const sx = Math.round((c + 0.5) / GRID_SIZE * imgW);
+      const sy = Math.round((r + 0.5) / GRID_SIZE * imgH);
+
+      // sample a small area for robustness
+      const sampleR = 2;
+      let rr = 0, gg = 0, bb = 0, count = 0;
+      for (let dy = -sampleR; dy <= sampleR; dy++) {
+        for (let dx = -sampleR; dx <= sampleR; dx++) {
+          const px = Math.max(0, Math.min(imgW - 1, sx + dx));
+          const py = Math.max(0, Math.min(imgH - 1, sy + dy));
+          const data = offCtx.getImageData(px, py, 1, 1).data;
+          rr += data[0]; gg += data[1]; bb += data[2]; count++;
+        }
+      }
+      rr = Math.round(rr / count);
+      gg = Math.round(gg / count);
+      bb = Math.round(bb / count);
+
+      grid[r][c] = closestPaletteIndex(rr, gg, bb);
+    }
+  }
+}
+
+// ─── Distance Calculation ──────────────────────────────────────────
+function calcDistances(r, c) {
+  const color = grid[r][c];
+  const dirs = [
+    { dr: -1, dc: 0, label: 'Up' },
+    { dr: 1, dc: 0, label: 'Down' },
+    { dr: 0, dc: -1, label: 'Left' },
+    { dr: 0, dc: 1, label: 'Right' },
+  ];
+  const results = [];
+  for (const { dr, dc, label } of dirs) {
+    // Walk same-color dots
+    let sameCount = 0;
+    let nr = r + dr, nc = c + dc;
+    while (nr >= 0 && nr < GRID_SIZE && nc >= 0 && nc < GRID_SIZE && grid[nr][nc] === color) {
+      sameCount++;
+      nr += dr;
+      nc += dc;
+    }
+    const sameHitEdge = nr < 0 || nr >= GRID_SIZE || nc < 0 || nc >= GRID_SIZE;
+
+    if (sameCount > 0 || sameHitEdge) {
+      // Case 1: same-color run (or single dot hitting edge)
+      results.push({
+        label, dist: sameCount, hitEdge: sameHitEdge, mode: 'same',
+        endR: nr - dr, endC: nc - dc,
+      });
+    } else {
+      // Case 2: adjacent dot is already different — measure that block's length
+      const adjColor = grid[nr][nc];
+      let adjCount = 0;
+      while (nr >= 0 && nr < GRID_SIZE && nc >= 0 && nc < GRID_SIZE && grid[nr][nc] === adjColor) {
+        adjCount++;
+        nr += dr;
+        nc += dc;
+      }
+      const adjHitEdge = nr < 0 || nr >= GRID_SIZE || nc < 0 || nc >= GRID_SIZE;
+      results.push({
+        label, dist: adjCount, hitEdge: adjHitEdge, mode: 'adjacent',
+        endR: nr - dr, endC: nc - dc,
+      });
+    }
+  }
+  return results;
+}
+
+// ─── Rendering ─────────────────────────────────────────────────────
+function resizeCanvas() {
+  canvas.width = mainEl.clientWidth;
+  canvas.height = mainEl.clientHeight;
+  render();
+}
+
+function cellSize() { return CELL_SIZE_BASE * scale; }
+
+function gridToScreen(r, c) {
+  const cs = cellSize();
+  return {
+    x: offsetX + c * cs + cs / 2,
+    y: offsetY + r * cs + cs / 2,
+  };
+}
+
+function screenToGrid(sx, sy) {
+  const cs = cellSize();
+  const c = Math.floor((sx - offsetX) / cs);
+  const r = Math.floor((sy - offsetY) / cs);
+  if (r < 0 || r >= GRID_SIZE || c < 0 || c >= GRID_SIZE) return null;
+  return { r, c };
+}
+
+function fitToScreen() {
+  const w = mainEl.clientWidth;
+  const h = mainEl.clientHeight;
+  const margin = 20;
+  scale = Math.min((w - margin * 2) / (GRID_SIZE * CELL_SIZE_BASE),
+                   (h - margin * 2) / (GRID_SIZE * CELL_SIZE_BASE));
+  const totalW = GRID_SIZE * cellSize();
+  const totalH = GRID_SIZE * cellSize();
+  offsetX = (w - totalW) / 2;
+  offsetY = (h - totalH) / 2;
+  render();
+}
+
+function render() {
+  if (!grid) return;
+  const w = canvas.width, h = canvas.height;
+  const cs = cellSize();
+  const dotR = cs * DOT_RADIUS_FRAC;
+
+  ctx.clearRect(0, 0, w, h);
+
+  // draw dots
+  for (let r = 0; r < GRID_SIZE; r++) {
+    for (let c = 0; c < GRID_SIZE; c++) {
+      const { x, y } = gridToScreen(r, c);
+      // skip if offscreen
+      if (x + dotR < 0 || x - dotR > w || y + dotR < 0 || y - dotR > h) continue;
+      ctx.fillStyle = PALETTE[grid[r][c]].css;
+      ctx.beginPath();
+      ctx.arc(x, y, dotR, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // section grid
+  if (sectionGridOn) {
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+    ctx.lineWidth = 2;
+    for (let i = 0; i <= GRID_SIZE; i += SECTION_SIZE) {
+      const sx = offsetX + i * cs;
+      const sy = offsetY + i * cs;
+      // vertical
+      ctx.beginPath();
+      ctx.moveTo(sx, offsetY);
+      ctx.lineTo(sx, offsetY + GRID_SIZE * cs);
+      ctx.stroke();
+      // horizontal
+      ctx.beginPath();
+      ctx.moveTo(offsetX, sy);
+      ctx.lineTo(offsetX + GRID_SIZE * cs, sy);
+      ctx.stroke();
+    }
+  }
+
+  // hover effects
+  if (hoverCell) {
+    const { r, c } = hoverCell;
+
+    // crosshair highlight
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
+    ctx.fillRect(offsetX, offsetY + r * cs, GRID_SIZE * cs, cs);
+    ctx.fillRect(offsetX + c * cs, offsetY, cs, GRID_SIZE * cs);
+
+    // distance rays
+    const dists = calcDistances(r, c);
+    const { x: hx, y: hy } = gridToScreen(r, c);
+
+    for (const d of dists) {
+      const { x: ex, y: ey } = gridToScreen(d.endR, d.endC);
+
+      // ray line — red for same-color run, cyan for adjacent-block
+      const rayColor = d.mode === 'same'
+        ? 'rgba(233, 69, 96, 0.7)'
+        : 'rgba(0, 200, 220, 0.7)';
+      ctx.strokeStyle = rayColor;
+      ctx.lineWidth = Math.max(2, cs * 0.12);
+      ctx.beginPath();
+      ctx.moveTo(hx, hy);
+      ctx.lineTo(ex, ey);
+      ctx.stroke();
+
+      // distance label
+      const label = d.hitEdge ? `${d.dist}→edge` : `${d.dist}`;
+      const midX = (hx + ex) / 2;
+      const midY = (hy + ey) / 2;
+
+      const fontSize = Math.max(10, cs * 0.6);
+      ctx.font = `bold ${fontSize}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+
+      // offset label perpendicular to ray direction
+      let lx = midX, ly = midY;
+      if (d.label === 'Up' || d.label === 'Down') {
+        lx += cs * 0.7;
+      } else {
+        ly -= cs * 0.7;
+      }
+
+      // background
+      const metrics = ctx.measureText(label);
+      const pad = 3;
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+      ctx.fillRect(lx - metrics.width / 2 - pad, ly - fontSize / 2 - pad,
+                    metrics.width + pad * 2, fontSize + pad * 2);
+      ctx.fillStyle = d.mode === 'same' ? '#fff' : '#00e0ef';
+      ctx.fillText(label, lx, ly);
+    }
+
+    // highlight hovered dot with ring
+    ctx.strokeStyle = '#e94560';
+    ctx.lineWidth = Math.max(2, cs * 0.1);
+    ctx.beginPath();
+    ctx.arc(hx, hy, dotR + cs * 0.08, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // update info panel
+    const color = PALETTE[grid[r][c]];
+    infoCoords.textContent = `Row ${r + 1}, Col ${c + 1}`;
+    infoColor.style.color = color.css;
+    infoColor.textContent = color.name;
+
+    const distStrs = dists.map(d => {
+      const prefix = d.mode === 'adjacent' ? '~' : '';
+      return `${d.label[0]}:${prefix}${d.hitEdge ? d.dist + '→e' : d.dist}`;
+    });
+    infoDist.textContent = distStrs.join('  ');
+  } else {
+    infoCoords.textContent = '—';
+    infoColor.textContent = '—';
+    infoColor.style.color = '#eee';
+    infoDist.textContent = '—';
+  }
+}
+
+// ─── Mouse Interaction ─────────────────────────────────────────────
+canvas.addEventListener('mousemove', e => {
+  if (isPanning) {
+    offsetX = panStartOX + (e.clientX - panStartX);
+    offsetY = panStartOY + (e.clientY - panStartY);
+    render();
+    return;
+  }
+  const rect = canvas.getBoundingClientRect();
+  const cell = screenToGrid(e.clientX - rect.left, e.clientY - rect.top);
+  if (!cell && hoverCell) { hoverCell = null; render(); }
+  else if (cell && (!hoverCell || cell.r !== hoverCell.r || cell.c !== hoverCell.c)) {
+    hoverCell = cell;
+    render();
+  }
+});
+
+canvas.addEventListener('mouseleave', () => {
+  if (hoverCell) { hoverCell = null; render(); }
+});
+
+canvas.addEventListener('mousedown', e => {
+  if (!grid) return;
+  if (correctionMode) return; // handled in click
+  isPanning = true;
+  panStartX = e.clientX;
+  panStartY = e.clientY;
+  panStartOX = offsetX;
+  panStartOY = offsetY;
+});
+
+canvas.addEventListener('mouseup', () => { isPanning = false; });
+canvas.addEventListener('mouseleave', () => { isPanning = false; });
+
+canvas.addEventListener('click', e => {
+  if (!grid || !correctionMode) return;
+  const rect = canvas.getBoundingClientRect();
+  const cell = screenToGrid(e.clientX - rect.left, e.clientY - rect.top);
+  if (!cell) return;
+  grid[cell.r][cell.c] = (grid[cell.r][cell.c] + 1) % PALETTE.length;
+  render();
+});
+
+// zoom
+canvas.addEventListener('wheel', e => {
+  if (!grid) return;
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+
+  const oldScale = scale;
+  const zoomFactor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+  scale = Math.max(0.3, Math.min(15, scale * zoomFactor));
+
+  // zoom toward mouse position
+  const scaleRatio = scale / oldScale;
+  offsetX = mx - (mx - offsetX) * scaleRatio;
+  offsetY = my - (my - offsetY) * scaleRatio;
+
+  hoverCell = screenToGrid(mx, my);
+  render();
+}, { passive: false });
+
+// ─── Toolbar Buttons ───────────────────────────────────────────────
+btnSectionGrid.addEventListener('click', () => {
+  sectionGridOn = !sectionGridOn;
+  btnSectionGrid.classList.toggle('active', sectionGridOn);
+  render();
+});
+
+btnCorrection.addEventListener('click', () => {
+  correctionMode = !correctionMode;
+  btnCorrection.classList.toggle('active', correctionMode);
+  canvas.style.cursor = correctionMode ? 'pointer' : 'crosshair';
+});
+
+btnFit.addEventListener('click', fitToScreen);
+
+// ─── Init ──────────────────────────────────────────────────────────
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+</script>
+</body>
+</html>
